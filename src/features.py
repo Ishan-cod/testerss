@@ -1,102 +1,111 @@
-import re
 import numpy as np
-from rapidfuzz import fuzz
-
-_NAME_STOP_TOKENS = {
-    "corporation", "incorporated", "limited", "private", "company",
-    "enterprise", "enterprises", "llp", "llc", "the", "and", "of",
-}
+import polars as pl
+from rapidfuzz import fuzz, process
 
 
-def _tokens(x):
-    return set(t for t in x.split() if t and t not in _NAME_STOP_TOKENS)
+def compute_features(pairs: pl.DataFrame,
+                     s1_feats: pl.DataFrame,
+                     s23_feats: pl.DataFrame) -> pl.DataFrame:
+    """
+    pairs: DataFrame with columns [source1_entity_id, candidate_entity_id]
+    s1_feats, s23_feats: normalized dataframes with required columns
+    """
+    left = s1_feats.select([
+        pl.col("entity_id").alias("source1_entity_id"),
+        pl.col("name_clean").alias("s1_name"),
+        pl.col("name_core").alias("s1_name_core"),
+        pl.col("addr_clean").alias("s1_addr"),
+        pl.col("country_clean").alias("s1_country"),
+        pl.col("postal").alias("s1_postal"),
+    ])
+    right = s23_feats.select([
+        pl.col("entity_id").alias("candidate_entity_id"),
+        pl.col("name_clean").alias("c_name"),
+        pl.col("name_core").alias("c_name_core"),
+        pl.col("addr_clean").alias("c_addr"),
+        pl.col("country_clean").alias("c_country"),
+        pl.col("postal").alias("c_postal"),
+    ])
+
+    df = pairs.join(left, on="source1_entity_id", how="left") \
+              .join(right, on="candidate_entity_id", how="left")
+
+    # Vectorized exact features
+    df = df.with_columns([
+        (pl.col("s1_country") == pl.col("c_country")).cast(pl.Int8).alias("same_country"),
+        ((pl.col("s1_postal") != "") &
+         (pl.col("s1_postal") == pl.col("c_postal"))).cast(pl.Int8).alias("same_postal"),
+        (pl.col("s1_name_core").str.len_chars()).alias("s1_name_len"),
+        (pl.col("c_name_core").str.len_chars()).alias("c_name_len"),
+        (pl.col("s1_addr").str.len_chars()).alias("s1_addr_len"),
+        (pl.col("c_addr").str.len_chars()).alias("c_addr_len"),
+    ])
+    df = df.with_columns([
+        (pl.col("s1_name_len") - pl.col("c_name_len")).abs().alias("len_name_diff"),
+        (pl.col("s1_addr_len") - pl.col("c_addr_len")).abs().alias("len_addr_diff"),
+    ])
+
+    # Fuzzy features in batches using rapidfuzz.process.cpdist
+    fuzzy_cols = ["name_ratio","name_partial","name_token_set",
+                  "name_token_sort","name_wratio",
+                  "addr_ratio","addr_partial","addr_token_set",
+                  "addr_token_sort","core_ratio","core_token_set"]
+
+    n = df.height
+    name_ratio = np.empty(n, dtype=np.float32)
+    name_partial = np.empty(n, dtype=np.float32)
+    name_token_set = np.empty(n, dtype=np.float32)
+    name_token_sort = np.empty(n, dtype=np.float32)
+    name_wratio = np.empty(n, dtype=np.float32)
+    addr_ratio = np.empty(n, dtype=np.float32)
+    addr_partial = np.empty(n, dtype=np.float32)
+    addr_token_set = np.empty(n, dtype=np.float32)
+    addr_token_sort = np.empty(n, dtype=np.float32)
+    core_ratio = np.empty(n, dtype=np.float32)
+    core_token_set = np.empty(n, dtype=np.float32)
+
+    s1_names = df["s1_name"].to_numpy()
+    c_names  = df["c_name"].to_numpy()
+    s1_addrs = df["s1_addr"].to_numpy()
+    c_addrs  = df["c_addr"].to_numpy()
+    s1_core  = df["s1_name_core"].to_numpy()
+    c_core   = df["c_name_core"].to_numpy()
+
+    B = 200_000
+    for start in range(0, n, B):
+        end = min(start + B, n)
+        name_ratio[start:end]       = process.cpdist(s1_names[start:end], c_names[start:end], scorer=fuzz.ratio, workers=-1) / 100.0
+        name_partial[start:end]     = process.cpdist(s1_names[start:end], c_names[start:end], scorer=fuzz.partial_ratio, workers=-1) / 100.0
+        name_token_set[start:end]   = process.cpdist(s1_names[start:end], c_names[start:end], scorer=fuzz.token_set_ratio, workers=-1) / 100.0
+        name_token_sort[start:end]  = process.cpdist(s1_names[start:end], c_names[start:end], scorer=fuzz.token_sort_ratio, workers=-1) / 100.0
+        name_wratio[start:end]      = process.cpdist(s1_names[start:end], c_names[start:end], scorer=fuzz.WRatio, workers=-1) / 100.0
+        addr_ratio[start:end]       = process.cpdist(s1_addrs[start:end], c_addrs[start:end], scorer=fuzz.ratio, workers=-1) / 100.0
+        addr_partial[start:end]     = process.cpdist(s1_addrs[start:end], c_addrs[start:end], scorer=fuzz.partial_ratio, workers=-1) / 100.0
+        addr_token_set[start:end]   = process.cpdist(s1_addrs[start:end], c_addrs[start:end], scorer=fuzz.token_set_ratio, workers=-1) / 100.0
+        addr_token_sort[start:end]  = process.cpdist(s1_addrs[start:end], c_addrs[start:end], scorer=fuzz.token_sort_ratio, workers=-1) / 100.0
+        core_ratio[start:end]       = process.cpdist(s1_core[start:end], c_core[start:end], scorer=fuzz.ratio, workers=-1) / 100.0
+        core_token_set[start:end]   = process.cpdist(s1_core[start:end], c_core[start:end], scorer=fuzz.token_set_ratio, workers=-1) / 100.0
+
+    df = df.with_columns([
+        pl.Series("name_ratio", name_ratio),
+        pl.Series("name_partial", name_partial),
+        pl.Series("name_token_set", name_token_set),
+        pl.Series("name_token_sort", name_token_sort),
+        pl.Series("name_wratio", name_wratio),
+        pl.Series("addr_ratio", addr_ratio),
+        pl.Series("addr_partial", addr_partial),
+        pl.Series("addr_token_set", addr_token_set),
+        pl.Series("addr_token_sort", addr_token_sort),
+        pl.Series("core_ratio", core_ratio),
+        pl.Series("core_token_set", core_token_set),
+    ])
+    df = df.drop(["s1_name","c_name","s1_addr","c_addr","s1_name_core","c_name_core"])
+    return df
 
 
-def _jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
-def _dice(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return 2 * len(a & b) / (len(a) + len(b))
-
-
-def _acronym_match(a: str, b: str) -> int:
-    def acro(x):
-        return "".join(w[0] for w in x.split() if w)
-    return int(acro(a) == acro(b) and len(acro(a)) >= 2)
-
-
-def pair_features(s1: dict, s2: dict) -> dict:
-    nc1, nc2 = s1["name_clean"], s2["name_clean"]
-    ac1, ac2 = s1["addr_clean"], s2["addr_clean"]
-
-    f = {}
-
-    # ---------- Name similarity ----------
-    f["name_ratio"]         = fuzz.ratio(nc1, nc2) / 100.0
-    f["name_partial"]       = fuzz.partial_ratio(nc1, nc2) / 100.0
-    f["name_token_set"]     = fuzz.token_set_ratio(nc1, nc2) / 100.0
-    f["name_token_sort"]    = fuzz.token_sort_ratio(nc1, nc2) / 100.0
-    f["name_wratio"]        = fuzz.WRatio(nc1, nc2) / 100.0
-
-    # ---------- Address similarity ----------
-    f["addr_ratio"]         = fuzz.ratio(ac1, ac2) / 100.0
-    f["addr_partial"]       = fuzz.partial_ratio(ac1, ac2) / 100.0
-    f["addr_token_set"]     = fuzz.token_set_ratio(ac1, ac2) / 100.0
-    f["addr_token_sort"]    = fuzz.token_sort_ratio(ac1, ac2) / 100.0
-
-    # ---------- Token overlap ----------
-    n1_toks, n2_toks = _tokens(nc1), _tokens(nc2)
-    a1_toks, a2_toks = _tokens(ac1), _tokens(ac2)
-    f["name_jaccard"]       = _jaccard(n1_toks, n2_toks)
-    f["name_dice"]          = _dice(n1_toks, n2_toks)
-    f["addr_jaccard"]       = _jaccard(a1_toks, a2_toks)
-    f["addr_dice"]          = _dice(a1_toks, a2_toks)
-    f["name_token_overlap"] = len(n1_toks & n2_toks)
-    f["addr_token_overlap"] = len(a1_toks & a2_toks)
-
-    # ---------- Structure / length ----------
-    f["len_name_diff"]      = abs(len(nc1) - len(nc2))
-    f["len_addr_diff"]      = abs(len(ac1) - len(ac2))
-    f["name_len_min"]       = min(len(nc1), len(nc2))
-    f["addr_len_min"]       = min(len(ac1), len(ac2))
-
-    # ---------- Exact-match style ----------
-    f["same_country"]       = int(s1["country_clean"] == s2["country_clean"])
-    f["same_postal"]        = int(
-        s1["postal"] != "" and s1["postal"] == s2["postal"]
-    )
-    f["same_house_no"]      = int(
-        s1["house_no"] != "" and s1["house_no"] == s2["house_no"]
-    )
-    f["first_token_eq"]     = int(
-        nc1.split()[0] == nc2.split()[0] if nc1 and nc2 else 0
-    )
-    f["acronym_match"]      = _acronym_match(nc1, nc2)
-
-    # ---------- Substring containment ----------
-    f["name_in_name"]       = int(nc1 in nc2 or nc2 in nc1) if nc1 and nc2 else 0
-    f["addr_in_addr"]       = int(ac1 in ac2 or ac2 in ac1) if ac1 and ac2 else 0
-
-    # Guard against NaN/inf
-    for k, v in f.items():
-        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
-            f[k] = 0.0
-    return f
-
-
-FEATURE_NAMES = None  # set on first call
-
-
-def feature_names():
-    global FEATURE_NAMES
-    if FEATURE_NAMES is None:
-        # Deterministic: call once with dummy data
-        dummy = dict(name_clean="a b", addr_clean="c d",
-                     country_clean="us", postal="", house_no="")
-        FEATURE_NAMES = sorted(pair_features(dummy, dummy).keys())
-    return FEATURE_NAMES
+FEATURE_COLS = [
+    "same_country","same_postal","len_name_diff","len_addr_diff",
+    "name_ratio","name_partial","name_token_set","name_token_sort","name_wratio",
+    "addr_ratio","addr_partial","addr_token_set","addr_token_sort",
+    "core_ratio","core_token_set",
+]

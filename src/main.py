@@ -1,109 +1,93 @@
-import time
-import random
+import time, random
 import numpy as np
-import pandas as pd
-
+import polars as pl
 from . import config
-from .load_data import load_train, load_test, parse_ground_truth
-from .normalize import add_normalized_columns
-from .blocking import build_index
-from .train import build_training_frame, train_model, tune_threshold
-from .predict import predict_test, write_outputs
-from .metrics import macro_f05
+from .io_polars import load_source
+from .pairs import build_features_for_split
+from .train import attach_labels, subsample, train_lgb
+from .metrics import macro_f05, f05_single
+from .predict import predict_and_write
 
 
-def _seed():
-    random.seed(config.RANDOM_STATE)
-    np.random.seed(config.RANDOM_STATE)
+def parse_gt(path):
+    gt = pl.read_csv(path, separator="\t", infer_schema_length=0, quote_char=None).fill_null("")
+    out = {}
+    for s1, ids in zip(gt["source1_entity_id"].to_list(), gt["matched_entity_ids"].to_list()):
+        out[s1] = {x.strip() for x in ids.split(",") if x.strip()}
+    return out
+
+
+def tune_threshold(df_pairs: pl.DataFrame, gt_map, s1_ids, model):
+    X = df_pairs.select(__import__("src.features", fromlist=["FEATURE_COLS"]).FEATURE_COLS).to_pandas()
+    prob = model.predict_proba(X)[:, 1]
+    df_pairs = df_pairs.with_columns(pl.Series("prob", prob))
+
+    best_thr, best = 0.5, -1.0
+    for thr in np.arange(0.10, 0.96, 0.025):
+        preds = (
+            df_pairs.filter(pl.col("prob") >= thr)
+                    .group_by("source1_entity_id")
+                    .agg(pl.col("candidate_entity_id").alias("m"))
+        )
+        pred_map = {s1: set(l) for s1, l in zip(preds["source1_entity_id"], preds["m"])}
+        score = macro_f05(gt_map, pred_map, s1_ids)
+        if score > best:
+            best, best_thr = score, float(thr)
+    return best_thr, best
 
 
 def main():
-    t0 = time.time()
-    _seed()
+    random.seed(config.RANDOM_STATE); np.random.seed(config.RANDOM_STATE)
 
-    print("== Loading data ==")
-    tr_s1, tr_s2, tr_s3, gt = load_train()
-    te_s1, te_s2, te_s3 = load_test()
+    print("Loading and normalizing ...")
+    tr_s1  = load_source(config.TRAIN_S1)
+    tr_s2  = load_source(config.TRAIN_S2)
+    tr_s3  = load_source(config.TRAIN_S3)
+    te_s1  = load_source(config.TEST_S1)
+    te_s2  = load_source(config.TEST_S2)
+    te_s3  = load_source(config.TEST_S3)
 
-    print(f"Train S1={len(tr_s1)}, S2={len(tr_s2)}, S3={len(tr_s3)}")
-    print(f"Test  S1={len(te_s1)}, S2={len(te_s2)}, S3={len(te_s3)}")
+    tr_s23 = pl.concat([tr_s2, tr_s3], how="vertical_relaxed")
+    te_s23 = pl.concat([te_s2, te_s3], how="vertical_relaxed")
 
-    print("== Normalizing ==")
-    tr_s1 = add_normalized_columns(tr_s1)
-    tr_s2 = add_normalized_columns(tr_s2)
-    tr_s3 = add_normalized_columns(tr_s3)
-    te_s1 = add_normalized_columns(te_s1)
-    te_s2 = add_normalized_columns(te_s2)
-    te_s3 = add_normalized_columns(te_s3)
+    gt_map = parse_gt(config.TRAIN_GT)
 
-    tr_s23 = pd.concat([tr_s2, tr_s3], ignore_index=True)
-    te_s23 = pd.concat([te_s2, te_s3], ignore_index=True)
+    # ---------- TRAIN feature generation ----------
+    print("Building training features (chunked) ...")
+    tr_feat_path = build_features_for_split(tr_s1, tr_s23, "train")
 
-    gt_map = parse_ground_truth(gt)
+    print("Attaching labels and subsampling ...")
+    df = attach_labels(tr_feat_path, gt_map)
 
-    print("== Splitting train/val by S1 entity ==")
-    s1_ids = list(tr_s1["entity_id"])
-    random.shuffle(s1_ids)
-    n_val = int(len(s1_ids) * config.VAL_FRACTION)
-    val_ids = set(s1_ids[:n_val])
-    trn_ids = set(s1_ids[n_val:])
+    # Split by S1 for validation
+    all_s1 = df["source1_entity_id"].unique().to_list()
+    random.shuffle(all_s1)
+    n_val = int(len(all_s1) * config.VAL_FRACTION)
+    val_ids = set(all_s1[:n_val]); trn_ids = set(all_s1[n_val:])
 
-    trn_s1 = tr_s1[tr_s1["entity_id"].isin(trn_ids)].reset_index(drop=True)
-    val_s1 = tr_s1[tr_s1["entity_id"].isin(val_ids)].reset_index(drop=True)
+    df_tr = df.filter(pl.col("source1_entity_id").is_in(trn_ids))
+    df_va = df.filter(pl.col("source1_entity_id").is_in(val_ids))
 
-    # For training only, index over S2+S3 (this leaks S1? No — S2/S3 have no S1 IDs)
-    print("== Building blocking index (train) ==")
-    train_idx = build_index(tr_s23)
+    df_tr_ss = subsample(df_tr, neg_ratio=5, seed=config.RANDOM_STATE)
 
-    print("== Building training frame ==")
-    X_tr, y_tr, meta_tr = build_training_frame(trn_s1, tr_s23, gt_map, train_idx)
-    X_val, y_val, meta_val = build_training_frame(val_s1, tr_s23, gt_map, train_idx)
+    print("Training LightGBM ...")
+    model = train_lgb(df_tr_ss)
 
-    print(f"Train pairs: {len(X_tr)} (pos={int(y_tr.sum())})")
-    print(f"Val   pairs: {len(X_val)} (pos={int(y_val.sum())})")
+    print("Tuning threshold on validation ...")
+    thr, val_f05 = tune_threshold(df_va, gt_map, list(val_ids), model)
+    print(f"Val macro F0.5 = {val_f05:.4f} @ thr = {thr:.3f}")
 
-    print("== Training model ==")
-    model = train_model(X_tr, y_tr)
+    # ---------- TEST inference ----------
+    print("Building test features (chunked) ...")
+    te_feat_path = build_features_for_split(te_s1, te_s23, "test")
 
-    print("== Tuning threshold for F0.5 ==")
-    best_thr, best_f05 = tune_threshold(model, X_val, meta_val, gt_map, val_ids)
-    print(f"Best threshold={best_thr:.3f} | Val macro F0.5={best_f05:.4f}")
-
-    # Retrain on full training data (train + val) for the final model
-    print("== Retraining on full training set ==")
-    X_full, y_full, _ = build_training_frame(tr_s1, tr_s23, gt_map, train_idx)
-    final_model = train_model(X_full, y_full)
-
-    # Rebuild threshold using the *validation* split but the *final* model
-    # (fast, since we already have X_val / meta_val)
-    final_thr, final_f05 = tune_threshold(
-        final_model, X_val, meta_val, gt_map, val_ids
-    )
-    print(f"Final model threshold={final_thr:.3f} | Val macro F0.5={final_f05:.4f}")
-
-    # ---------- Test inference ----------
-    print("== Blocking on test ==")
-    test_idx = build_index(te_s23)
-    s23_lookup = te_s23.set_index("entity_id").to_dict("index")
-
-    print("== Predicting ==")
-    cand_map, match_map = predict_test(
-        final_model, final_thr, te_s1, te_s23, test_idx, s23_lookup
-    )
-
-    print("== Writing outputs ==")
-    write_outputs(list(te_s1["entity_id"]), cand_map, match_map)
-
-    # Sanity stats
-    n_singletons_pred = sum(1 for s1 in te_s1["entity_id"] if not match_map[s1])
-    avg_cands = sum(len(v) for v in cand_map.values()) / max(len(cand_map), 1)
-    avg_matches = sum(len(v) for v in match_map.values()) / max(len(match_map), 1)
-    print(f"Predicted singletons: {n_singletons_pred}/{len(te_s1)}")
-    print(f"Avg candidates per S1: {avg_cands:.2f}")
-    print(f"Avg matches per S1:   {avg_matches:.2f}")
-
-    print(f"Done in {time.time() - t0:.1f}s")
+    print("Writing outputs ...")
+    predict_and_write(model, thr, te_feat_path,
+                      te_s1["entity_id"].to_list(),
+                      config.OUT_MATCH, config.OUT_CAND)
 
 
 if __name__ == "__main__":
+    t = time.time()
     main()
+    print(f"Total time: {time.time() - t:.1f}s")
